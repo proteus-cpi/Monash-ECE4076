@@ -45,6 +45,7 @@ Options:
   --python <interpreter>  Python interpreter to use to create the venv (default: python3)
   --uv-bin <path>         Path to the uv binary (default: uv)
   --install-shell-func    Append activate_venv() and alias activate-venv to ~/.bashrc
+  --no-gpu-detect         Disable automatic GPU detection for selecting torch backend
   -h, --help              Show this help
 
 Examples:
@@ -217,6 +218,7 @@ BASHFUNC
 install_uv() {
   local TORCH_BACKEND=""
   local INSTALL_SHELL_FUNC=false
+  local AUTO_GPU_DETECT=true
   local VENV_DIR="$DEFAULT_VENV_DIR"
   local PYTHON_BIN="$DEFAULT_PYTHON"
   local UV_BIN="$DEFAULT_UV_BIN"
@@ -232,6 +234,8 @@ install_uv() {
         if [ -n "${2-}" ]; then TORCH_BACKEND="$2"; shift 2; else echo "--torch-backend requires a value"; return 1; fi;;
       --venv-dir|--venv)
         if [ -n "${2-}" ]; then VENV_DIR="$2"; shift 2; else echo "--venv-dir requires a path"; return 1; fi;;
+      --no-gpu-detect)
+        AUTO_GPU_DETECT=false; shift;;
       --python)
         if [ -n "${2-}" ]; then PYTHON_BIN="$2"; shift 2; else echo "--python requires a value"; return 1; fi;;
       --uv-bin)
@@ -268,6 +272,24 @@ install_uv() {
   local PY_VER
   PY_VER="$($PYTHON_BIN -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')"
   printf 'Found Python %s (interpreter: %s)\n' "$PY_VER" "$PYTHON_BIN"
+
+  # GPU detection - simple heuristics
+  local DETECTED_GPU="none"
+  if [ "$AUTO_GPU_DETECT" = true ]; then
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      DETECTED_GPU="nvidia"
+    elif command -v rocminfo >/dev/null 2>&1 || command -v rocm-smi >/dev/null 2>&1; then
+      DETECTED_GPU="amd"
+    elif command -v lspci >/dev/null 2>&1 && lspci | grep -i intel | grep -i vga >/dev/null 2>&1; then
+      # Intel GPUs are less commonly supported by PyTorch; treat as intel
+      DETECTED_GPU="intel"
+    else
+      DETECTED_GPU="cpu"
+    fi
+  else
+    DETECTED_GPU="undetected"
+  fi
+  printf 'Detected GPU: %s\n' "$DETECTED_GPU"
 
   # Create venv if missing
   if [ -d "$VENV_DIR" ] && [ -f "$VENV_DIR/bin/activate" -o -f "$VENV_DIR/pyvenv.cfg" ]; then
@@ -320,6 +342,26 @@ install_uv() {
       echo "uv pip compile failed; attempting uv lock as fallback (best-effort)"
       "$UV_BIN" lock || true
     fi
+  fi
+
+  # Decide torch backend if not explicitly provided
+  if [ -z "$TORCH_BACKEND" ]; then
+    case "$DETECTED_GPU" in
+      nvidia)
+        TORCH_BACKEND="auto" ;;
+      amd)
+        # Prefer auto so uv can choose the best ROCm/compatible wheel when available
+        TORCH_BACKEND="auto" ;;
+      intel)
+        TORCH_BACKEND="cpu" ;;
+      cpu)
+        TORCH_BACKEND="cpu" ;;
+      undetected)
+        TORCH_BACKEND="auto" ;;
+      *)
+        TORCH_BACKEND="auto" ;;
+    esac
+    printf 'Using torch backend: %s\n' "$TORCH_BACKEND"
   fi
 
   # Sync packages into the venv
