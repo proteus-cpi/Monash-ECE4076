@@ -9,19 +9,55 @@
 #
 # If you run this file directly (./source_me_first_4_uv.sh) it will print a short error and exit.
 
+# --------------------------- Help -------------------------------------
+install_uv_help() {
+  cat <<'HELP'
+install_uv [options]
+
+Create or reuse a local virtual environment and install dependencies using uv.
+
+Options:
+  --cpu-torch             Use CPU-only PyTorch wheels (sets --torch-backend=cpu)
+  --torch-backend <val>   Pass a specific value to uv pip sync --torch-backend
+  --venv-dir <path>       Path to virtualenv (default: ./.venv)
+  --python <interpreter>  Python interpreter to use to create the venv (default: python3)
+  --uv-bin <path>         Path to the uv binary (default: uv)
+  --install-shell-func    Append activate_venv() and alias activate-venv to ~/.bashrc
+  --no-gpu-detect         Disable automatic GPU detection for selecting torch backend
+  --dry-run               Preview the uv pip sync plan and prompt before installing
+  -y, --yes               Assume yes for prompts (useful for CI)
+  -h, --help              Show this help
+
+Examples:
+  install_uv --cpu-torch
+  install_uv --venv-dir .venv --python python3.11
+
+HELP
+}
+
 # --------------------------- Execution guard ---------------------------
-# If executed directly, print an error and usage hint then exit.
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+# If the script is executed rather than sourced, print usage guidance and help.
+_sourced=0
+if [ -n "${BASH_SOURCE-}" ]; then
+  if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    _sourced=1
+  fi
+else
+  (return 0 2>/dev/null) && _sourced=1 || _sourced=0
+fi
+if [ "$_sourced" -ne 1 ]; then
   cat <<'MSG' >&2
 This file is intended to be sourced, not executed.
 
 Usage:
   source ./source_me_first_4_uv.sh
-  install_uv --help        # show installer help after sourcing
+  . ./source_me_first_4_uv.sh
 
-Sourcing defines helper functions in your current shell. Exiting now.
+You can then call: install_uv --help
 MSG
-  exit 1
+  echo
+  install_uv_help
+  exit 0
 fi
 
 # --------------------------- Defaults ---------------------------------
@@ -344,8 +380,11 @@ install_uv() {
     fi
   fi
 
-  echo "Upgrading pip, setuptools and wheel in the venv..."
-  "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel || { echo "pip upgrade failed"; return 1; }
+  echo "Upgrading pip in the venv..."
+  # Avoid upgrading setuptools here because some packages (e.g. torch) may
+  # require an upper-bound on setuptools. Let the lockfile / uv pip sync
+  # control the setuptools version to prevent resolver conflicts.
+  "$VENV_PYTHON" -m pip install --upgrade pip || { echo "pip upgrade failed"; return 1; }
 
   # Prepare lockfile
   local LOCKFILE="uv.lock" PYLOCK="pylock.toml"
@@ -468,6 +507,149 @@ install_uv() {
   else
     echo "No lockfile found, falling back to pip install -r requirements.txt"
     "$VENV_PYTHON" -m pip install -r requirements.txt || { echo "pip install failed"; return 1; }
+  fi
+
+  # After syncing, ensure pip is available in the venv: some sync operations
+  # may remove or replace pip. If pip is missing, try to bootstrap it via
+  # ensurepip first, then fall back to get-pip.py. Avoid force-upgrading
+  # setuptools here to prevent conflicts with packages like torch which may
+  # require an upper-bound on setuptools.
+  if ! "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
+    echo "pip not found in venv after uv pip sync; attempting to bootstrap via ensurepip..."
+    if "$VENV_PYTHON" -m ensurepip --upgrade >/dev/null 2>&1; then
+      echo "ensurepip succeeded"
+    else
+      echo "ensurepip failed; attempting to download get-pip.py as fallback"
+      local TMP_GET_PIP
+      TMP_GET_PIP="$(mktemp -t get-pip.XXXXXX)" || { echo "mktemp failed"; return 1; }
+      if command -v curl >/dev/null 2>&1; then
+        curl -sS https://bootstrap.pypa.io/get-pip.py -o "$TMP_GET_PIP" || { echo "curl failed"; rm -f "$TMP_GET_PIP"; return 1; }
+      elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$TMP_GET_PIP" https://bootstrap.pypa.io/get-pip.py || { echo "wget failed"; rm -f "$TMP_GET_PIP"; return 1; }
+      else
+        echo "ERROR: cannot download get-pip.py because neither curl nor wget is available"
+        rm -f "$TMP_GET_PIP"
+        return 1
+      fi
+      # Install pip but avoid touching setuptools if possible; get-pip.py may
+      # upgrade setuptools - in that case, the user should prefer running
+      # install_uv with --update-lock to align lockfile.
+      "$VENV_PYTHON" "$TMP_GET_PIP" || { echo "get-pip.py failed"; rm -f "$TMP_GET_PIP"; return 1; }
+      rm -f "$TMP_GET_PIP"
+    fi
+  fi
+
+  # Post-sync compatibility check: ensure installed setuptools satisfies
+  # any setuptools requirement declared by installed torch (if present).
+  echo "Checking setuptools compatibility with installed torch (if any)..."
+  if ! "$VENV_PYTHON" - <<'PY'
+import sys, re
+from importlib import metadata as md
+try:
+    torch_ver = md.version('torch')
+except Exception:
+    # torch not installed; nothing to check
+    sys.exit(0)
+try:
+    setuptools_ver = md.version('setuptools')
+except Exception:
+    print('ERROR: setuptools is not installed in the venv', file=sys.stderr)
+    sys.exit(1)
+reqs = []
+try:
+    meta = md.metadata('torch')
+    # metadata.get_all may return None or a sequence
+    reqs = meta.get_all('Requires-Dist') or []
+except Exception:
+    reqs = []
+
+# Try to parse setuptools requirement robustly. Prefer packaging.Requirement when available.
+try:
+    from packaging.requirements import Requirement as _Req
+    from packaging.specifiers import SpecifierSet as _SpecSet
+    from packaging.version import Version as _Version
+    _packaging_available = True
+except Exception:
+    _packaging_available = False
+
+# Look through Requires-Dist entries for any setuptools requirement
+found_setuptools_req = False
+for r in reqs:
+    if 'setuptools' not in r.lower():
+        continue
+    # packaging-based parsing if available
+    if _packaging_available:
+        try:
+            reqobj = _Req(r)
+            if reqobj.name.lower() != 'setuptools':
+                continue
+            found_setuptools_req = True
+            spec = str(reqobj.specifier)
+            if not spec:
+                # no version constraint; nothing to enforce
+                continue
+            s = _SpecSet(spec)
+            sv = _Version(setuptools_ver)
+            if sv not in s:
+                print(f"ERROR: setuptools {setuptools_ver} does not satisfy torch requirement: {spec}", file=sys.stderr)
+                sys.exit(1)
+            continue
+        except Exception:
+            # fall back to legacy parsing below
+            pass
+
+    # Legacy parsing: accept forms like 'setuptools (<82)' or 'setuptools <82,>=40'
+    m = re.search(r'setuptools\s*\(([^)]+)\)', r, flags=re.IGNORECASE)
+    if m:
+        spec = m.group(1).strip()
+    else:
+        m2 = re.search(r'setuptools\s*([<>=!~,\s\d\.]+)', r, flags=re.IGNORECASE)
+        if m2:
+            spec = m2.group(1).strip()
+        else:
+            # no specifier found; treat as no constraint
+            continue
+
+    # simple numeric check fallback: compare numeric version tuples for common operators
+    tokens = [t.strip() for t in spec.split(',') if t.strip()]
+    def vtuple(v):
+        nums = re.findall(r'\d+', v)
+        return tuple(int(x) for x in nums) if nums else (0,)
+    svt = vtuple(setuptools_ver)
+    ok = True
+    for t in tokens:
+        t_norm = t.replace(' ', '')
+        if t_norm.startswith('<='):
+            n = vtuple(t_norm[2:])
+            if not svt <= n: ok = False
+        elif t_norm.startswith('<'):
+            n = vtuple(t_norm[1:])
+            if not svt < n: ok = False
+        elif t_norm.startswith('>='):
+            n = vtuple(t_norm[2:])
+            if not svt >= n: ok = False
+        elif t_norm.startswith('>'):
+            n = vtuple(t_norm[1:])
+            if not svt > n: ok = False
+        elif t_norm.startswith('=='):
+            n = vtuple(t_norm[2:])
+            if not svt == n: ok = False
+    if not ok:
+        print(f"ERROR: setuptools {setuptools_ver} does not satisfy torch requirement: {spec}", file=sys.stderr)
+        sys.exit(1)
+    found_setuptools_req = True
+
+if not found_setuptools_req:
+    # no explicit setuptools requirement; nothing to enforce
+    sys.exit(0)
+
+sys.exit(0)
+PY
+  then
+    echo "Setuptools compatibility check failed; please run install_uv --update-lock or adjust your environment.";
+    return 1
+  else
+    echo "Setuptools compatibility OK"
   fi
 
   echo "Packages installed"
