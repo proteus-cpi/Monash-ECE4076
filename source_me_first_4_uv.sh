@@ -46,6 +46,8 @@ Options:
   --uv-bin <path>         Path to the uv binary (default: uv)
   --install-shell-func    Append activate_venv() and alias activate-venv to ~/.bashrc
   --no-gpu-detect         Disable automatic GPU detection for selecting torch backend
+  --dry-run               Preview the uv pip sync plan and prompt before installing
+  -y, --yes               Assume yes for prompts (useful for CI)
   -h, --help              Show this help
 
 Examples:
@@ -219,6 +221,8 @@ install_uv() {
   local TORCH_BACKEND=""
   local INSTALL_SHELL_FUNC=false
   local AUTO_GPU_DETECT=true
+  local DRY_RUN=false
+  local AUTO_YES=false
   local VENV_DIR="$DEFAULT_VENV_DIR"
   local PYTHON_BIN="$DEFAULT_PYTHON"
   local UV_BIN="$DEFAULT_UV_BIN"
@@ -242,6 +246,10 @@ install_uv() {
         if [ -n "${2-}" ]; then UV_BIN="$2"; shift 2; else echo "--uv-bin requires a value"; return 1; fi;;
       --install-shell-func)
         INSTALL_SHELL_FUNC=true; shift;;
+      --dry-run)
+        DRY_RUN=true; shift;;
+      -y|--yes)
+        AUTO_YES=true; shift;;
       -h|--help)
         install_uv_help; return 0;;
       *) echo "Unknown option: $1"; install_uv_help; return 1;;
@@ -332,58 +340,83 @@ install_uv() {
 
   # Prepare lockfile
   local LOCKFILE="uv.lock" PYLOCK="pylock.toml"
-  if [ -f "$LOCKFILE" ] || [ -f "$PYLOCK" ]; then
-    echo "Found lockfile; will use it"
+
+  # Determine selected torch backend (user override takes precedence)
+  local SELECTED_TORCH_BACKEND
+  if [ -n "$TORCH_BACKEND" ]; then
+    SELECTED_TORCH_BACKEND="$TORCH_BACKEND"
   else
-    echo "No lockfile found; compiling requirements.txt -> pylock.toml"
-    if "$UV_BIN" pip compile requirements.txt --format pylock.toml -o "$PYLOCK"; then
-      echo "Generated $PYLOCK"
-    else
-      echo "uv pip compile failed; attempting uv lock as fallback (best-effort)"
-      "$UV_BIN" lock || true
-    fi
+    case "$DETECTED_GPU" in
+      nvidia) SELECTED_TORCH_BACKEND="auto" ;;
+      amd) SELECTED_TORCH_BACKEND="auto" ;;
+      intel) SELECTED_TORCH_BACKEND="cpu" ;;
+      cpu) SELECTED_TORCH_BACKEND="cpu" ;;
+      undetected) SELECTED_TORCH_BACKEND="cpu" ;;
+      *) SELECTED_TORCH_BACKEND="cpu" ;;
+    esac
   fi
+  printf 'Selected torch backend for compile/sync: %s\n' "$SELECTED_TORCH_BACKEND"
+
+  # Always (re)compile requirements.txt to pylock.toml using the selected backend
+  echo "Compiling requirements.txt -> $PYLOCK (torch backend: $SELECTED_TORCH_BACKEND)"
+  UV_TORCH_BACKEND="$SELECTED_TORCH_BACKEND" "$UV_BIN" pip compile requirements.txt --format pylock.toml -o "$PYLOCK" || {
+    echo "uv pip compile failed; attempting uv lock as fallback (best-effort)";
+    "$UV_BIN" lock || true;
+  }
 
   # Decide torch backend if not explicitly provided
+  # Ensure sync uses the same backend as the compile step unless the user explicitly
+  # provided --torch-backend. SELECTED_TORCH_BACKEND was used for compile; default
+  # the sync backend to that to avoid mismatches.
   if [ -z "$TORCH_BACKEND" ]; then
-    case "$DETECTED_GPU" in
-      nvidia)
-        TORCH_BACKEND="auto" ;;
-      amd)
-        # Prefer auto so uv can choose the best ROCm/compatible wheel when available
-        TORCH_BACKEND="auto" ;;
-      intel)
-        TORCH_BACKEND="cpu" ;;
-      cpu)
-        TORCH_BACKEND="cpu" ;;
-      undetected)
-        TORCH_BACKEND="auto" ;;
-      *)
-        TORCH_BACKEND="auto" ;;
-    esac
-    printf 'Using torch backend: %s\n' "$TORCH_BACKEND"
+    TORCH_BACKEND="$SELECTED_TORCH_BACKEND"
+  fi
+  printf 'Compile-time selected backend: %s\n' "$SELECTED_TORCH_BACKEND"
+  printf 'Sync-time backend to be used: %s\n' "$TORCH_BACKEND"
+
+  # Sync packages into the venv (with optional dry-run preview)
+  echo "Syncing packages into venv with uv pip sync..."
+  local SYNC_TARGET=""
+  if [ -f "$LOCKFILE" ]; then
+    SYNC_TARGET="$LOCKFILE"
+  elif [ -f "$PYLOCK" ]; then
+    SYNC_TARGET="$PYLOCK"
   fi
 
-  # Sync packages into the venv
-  echo "Syncing packages into venv with uv pip sync..."
-  if [ -n "$TORCH_BACKEND" ]; then
-    if [ -f "$LOCKFILE" ]; then
-      "$UV_BIN" pip sync "$LOCKFILE" --python "$VENV_PYTHON" --torch-backend "$TORCH_BACKEND" || { echo "uv pip sync failed"; return 1; }
-    elif [ -f "$PYLOCK" ]; then
-      "$UV_BIN" pip sync "$PYLOCK" --python "$VENV_PYTHON" --torch-backend "$TORCH_BACKEND" || { echo "uv pip sync failed"; return 1; }
+  # If dry-run requested, attempt to preview the plan. If uv doesn't support
+  # --dry-run the command may fail; offer the user a choice to continue.
+  if [ "$DRY_RUN" = true ]; then
+    if [ -n "$SYNC_TARGET" ]; then
+      echo "Running dry-run preview (uv pip sync --dry-run) against: $SYNC_TARGET"
+      if "$UV_BIN" pip sync "$SYNC_TARGET" --python "$VENV_PYTHON" --torch-backend "$TORCH_BACKEND" --dry-run; then
+        read -rp "Proceed with actual installation? [y/N]: " _resp
+        if ! printf '%s' "${_resp:-N}" | grep -Eq '^[Yy]'; then
+          echo "Aborting per user request"
+          return 0
+        fi
+      else
+        echo "Dry-run preview failed or --dry-run unsupported. Continue with install? [y/N]"
+        read -rp "" _resp
+        if ! printf '%s' "${_resp:-N}" | grep -Eq '^[Yy]'; then
+          echo "Aborting per user request"
+          return 1
+        fi
+      fi
     else
-      echo "No lockfile found, falling back to pip install -r requirements.txt"
-      "$VENV_PYTHON" -m pip install -r requirements.txt || { echo "pip install failed"; return 1; }
+      echo "No lockfile (uv.lock/pylock.toml) found; cannot perform a dry-run preview for pip install -r requirements.txt"
+      read -rp "Proceed with pip install -r requirements.txt? [y/N]: " _resp
+      if ! printf '%s' "${_resp:-N}" | grep -Eq '^[Yy]'; then
+        echo "Aborting per user request"
+        return 1
+      fi
     fi
+  fi
+
+  if [ -n "$SYNC_TARGET" ]; then
+    "$UV_BIN" pip sync "$SYNC_TARGET" --python "$VENV_PYTHON" --torch-backend "$TORCH_BACKEND" || { echo "uv pip sync failed"; return 1; }
   else
-    if [ -f "$LOCKFILE" ]; then
-      "$UV_BIN" pip sync "$LOCKFILE" --python "$VENV_PYTHON" || { echo "uv pip sync failed"; return 1; }
-    elif [ -f "$PYLOCK" ]; then
-      "$UV_BIN" pip sync "$PYLOCK" --python "$VENV_PYTHON" || { echo "uv pip sync failed"; return 1; }
-    else
-      echo "No lockfile found, falling back to pip install -r requirements.txt"
-      "$VENV_PYTHON" -m pip install -r requirements.txt || { echo "pip install failed"; return 1; }
-    fi
+    echo "No lockfile found, falling back to pip install -r requirements.txt"
+    "$VENV_PYTHON" -m pip install -r requirements.txt || { echo "pip install failed"; return 1; }
   fi
 
   echo "Packages installed"
