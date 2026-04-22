@@ -250,18 +250,20 @@ alias activate-venv='activate_venv'
 # --------------------------- Install to ~/.bashrc ---------------------
 # Appends the activate_venv function to ~/.bashrc if not already present.
 install_activate_func() {
+  # Optional first arg: auto-confirm ("true" to skip prompts)
+  local AUTO_CONFIRM="${1:-}"
   local rcfile="${HOME}/.bashrc"
-  if [ ! -w "$rcfile" ] && [ ! -w "${HOME}" ]; then
+
+  # Verify writeability (allow creating the file if HOME is writable)
+  if [ -e "$rcfile" ] && [ ! -w "$rcfile" ] && [ ! -w "${HOME}" ]; then
     echo "Cannot write to $rcfile; check permissions or install manually."
     return 1
   fi
 
-  if grep -q "^activate_venv()" "$rcfile" 2>/dev/null; then
-    echo "activate_venv already present in $rcfile"
-    return 0
-  fi
-
-  cat >> "$rcfile" <<'BASHFUNC'
+  # Create a temporary file that contains the canonical activate_venv block
+  local blockfile tmpfile backup
+  blockfile=$(mktemp -t activate_venv.block.XXXXXX) || { echo "mktemp failed"; return 1; }
+  cat > "$blockfile" <<'BASHFUNC'
 # BEGIN activate_venv (added by source_me_first_4_uv.sh)
 activate_venv() {
   local candidates=()
@@ -311,6 +313,7 @@ activate_venv() {
     echo "Selection out of range"
     return 1
   fi
+
   local target="${candidates[$((sel-1))]}"
   if [ -f "$target/bin/activate" ]; then
     # shellcheck disable=SC1090
@@ -332,7 +335,123 @@ activate_venv() {
 alias activate-venv='activate_venv'
 BASHFUNC
 
-  echo "Appended activate_venv and alias activate-venv to $rcfile"
+  # Helper: prompt with optional auto-confirm
+  _ask_confirm() {
+    local prompt="$1" default_yes=${2:-false}
+    if [ "$AUTO_CONFIRM" = "true" ] || [ "$AUTO_CONFIRM" = "yes" ]; then
+      return 0
+    fi
+    local ans
+    if [ "$default_yes" = true ]; then
+      read -rp "$prompt [Y/n]: " ans
+      ans="${ans:-Y}"
+    else
+      read -rp "$prompt [y/N]: " ans
+      ans="${ans:-N}"
+    fi
+    case "$ans" in
+      [Yy]*) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+
+  # Search for an explicit marker block first
+  local bline eline
+  bline=$(grep -n '^# BEGIN activate_venv' "$rcfile" 2>/dev/null | cut -d: -f1 | head -n1 || true)
+  if [ -n "$bline" ]; then
+    # find the END marker after the BEGIN marker
+    eline=$(awk -v b="$bline" 'NR>=b && /# END activate_venv/ {print NR; exit}' "$rcfile" 2>/dev/null || true)
+  fi
+
+  # If no marker block, try to find an unmarked function definition and its end
+  local fstart fend
+  if [ -z "$bline" ]; then
+    fstart=$(awk '/^[[:space:]]*(function[[:space:]]+activate_venv|activate_venv[[:space:]]*\(\))/ {print NR; exit}' "$rcfile" 2>/dev/null || true)
+    if [ -n "$fstart" ]; then
+      # find function end by scanning braces from fstart
+      local lineno=0 line brace open close
+      while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno+1))
+        if [ "$lineno" -lt "$fstart" ]; then
+          continue
+        fi
+        # if this is the first line of the function, initialize brace count
+        open=$(printf '%s' "$line" | tr -cd '{' | wc -c)
+        close=$(printf '%s' "$line" | tr -cd '}' | wc -c)
+        brace=$((brace + open - close))
+        if [ $brace -le 0 ]; then
+          fend=$lineno
+          break
+        fi
+      done < "$rcfile"
+      # if we reached EOF and didn't close, set end to last line
+      if [ -z "$fend" ]; then
+        fend=$lineno
+      fi
+    fi
+  fi
+
+  # Summarize findings and ask user what to do
+  if [ -n "$bline" ] && [ -n "$eline" ]; then
+    local ctx_start=$(( bline > 3 ? bline - 2 : 1 ))
+    echo "Found existing activate_venv block (marked) in $rcfile: lines ${bline}-${eline}."
+    sed -n "${ctx_start},$(( eline + 2 ))p" "$rcfile" | sed -n '1,200p'
+    if _ask_confirm "Replace existing marked activate_venv block in $rcfile?" false; then
+      : # proceed with replacement
+    else
+      rm -f "$blockfile"
+      echo "No changes made to $rcfile"
+      return 0
+    fi
+    local start_line="$bline" end_line="$eline"
+  elif [ -n "$fstart" ] && [ -n "$fend" ]; then
+    local ctx_start=$(( fstart > 3 ? fstart - 2 : 1 ))
+    echo "Found existing activate_venv function (unmarked) in $rcfile: lines ${fstart}-${fend}."
+    sed -n "${ctx_start},$(( fend + 2 ))p" "$rcfile" | sed -n '1,200p'
+    if _ask_confirm "Replace existing activate_venv function in $rcfile?" false; then
+      : # proceed
+    else
+      rm -f "$blockfile"
+      echo "No changes made to $rcfile"
+      return 0
+    fi
+    local start_line="$fstart" end_line="$fend"
+  else
+    echo "No existing activate_venv found in $rcfile."
+    if _ask_confirm "Append activate_venv to the end of $rcfile?" true; then
+      # append
+      backup="${rcfile}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+      cp -a "$rcfile" "$backup" 2>/dev/null || true
+      echo >> "$rcfile"
+      cat "$blockfile" >> "$rcfile"
+      rm -f "$blockfile"
+      echo "Appended activate_venv and alias activate-venv to $rcfile (backup: $backup)"
+      return 0
+    else
+      rm -f "$blockfile"
+      echo "No changes made to $rcfile"
+      return 0
+    fi
+  fi
+
+  # Perform replacement between start_line and end_line (inclusive)
+  tmpfile=$(mktemp -t activate_venv.rc.XXXXXX) || { echo "mktemp failed"; rm -f "$blockfile"; return 1; }
+  backup="${rcfile}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  cp -a "$rcfile" "$backup" 2>/dev/null || true
+  # head (lines before start)
+  if [ "$start_line" -gt 1 ]; then
+    head -n $(( start_line - 1 )) "$rcfile" > "$tmpfile"
+  else
+    : > "$tmpfile"
+  fi
+  # insert block
+  cat "$blockfile" >> "$tmpfile"
+  # append tail (lines after end)
+  tail -n +$(( end_line + 1 )) "$rcfile" >> "$tmpfile"
+  # install
+  mv "$tmpfile" "$rcfile"
+  rm -f "$blockfile"
+  echo "Replaced activate_venv in $rcfile (backup: $backup)"
   return 0
 }
 
