@@ -224,6 +224,8 @@ install_uv() {
   local DRY_RUN=false
   local AUTO_YES=false
   local APPLY=false
+  local CHECK_LOCK=false
+  local UPDATE_LOCK=false
   local VENV_DIR="$DEFAULT_VENV_DIR"
   local PYTHON_BIN="$DEFAULT_PYTHON"
   local UV_BIN="$DEFAULT_UV_BIN"
@@ -251,6 +253,10 @@ install_uv() {
         DRY_RUN=true; shift;;
       --apply)
         APPLY=true; shift;;
+      --check-lock)
+        CHECK_LOCK=true; shift;;
+      --update-lock)
+        UPDATE_LOCK=true; shift;;
       -y|--yes)
         AUTO_YES=true; shift;;
       -h|--help)
@@ -360,12 +366,42 @@ install_uv() {
   fi
   printf 'Selected torch backend for compile/sync: %s\n' "$SELECTED_TORCH_BACKEND"
 
+  # Optionally update the repo pylock (user requested) before proceeding.
+  if [ "$UPDATE_LOCK" = true ]; then
+    echo "Updating pylock.toml using backend: $SELECTED_TORCH_BACKEND"
+    UV_TORCH_BACKEND="$SELECTED_TORCH_BACKEND" "$UV_BIN" pip compile requirements.txt --format pylock.toml -o "$PYLOCK" || {
+      echo "uv pip compile failed while updating lock"; return 1;
+    }
+    echo "pylock.toml regenerated. Please review and commit the file if desired."
+  fi
+
   # Always (re)compile requirements.txt to pylock.toml using the selected backend
   echo "Compiling requirements.txt -> $PYLOCK (torch backend: $SELECTED_TORCH_BACKEND)"
   UV_TORCH_BACKEND="$SELECTED_TORCH_BACKEND" "$UV_BIN" pip compile requirements.txt --format pylock.toml -o "$PYLOCK" || {
     echo "uv pip compile failed; attempting uv lock as fallback (best-effort)";
     "$UV_BIN" lock || true;
   }
+
+  # If requested, compare freshly generated pylock with repo copy and fail if different
+  if [ "$CHECK_LOCK" = true ]; then
+    if [ -f "$PYLOCK" ]; then
+      local TMP_PL
+      TMP_PL="$(mktemp -t pylock.XXXXXX)" || { echo "mktemp failed"; return 1; }
+      UV_TORCH_BACKEND="$SELECTED_TORCH_BACKEND" "$UV_BIN" pip compile requirements.txt --format pylock.toml -o "$TMP_PL" || { echo "uv pip compile failed for check-lock"; rm -f "$TMP_PL"; return 1; }
+      if ! diff -u "$PYLOCK" "$TMP_PL" >/dev/null 2>&1; then
+        echo "pylock.toml in repo differs from freshly compiled lock (backend: $SELECTED_TORCH_BACKEND)."
+        echo "Run 'install_uv --update-lock' to regenerate pylock.toml and commit the change, or review differences below:"
+        diff -u "$PYLOCK" "$TMP_PL" || true
+        rm -f "$TMP_PL"
+        return 2
+      fi
+      rm -f "$TMP_PL"
+      echo "pylock.toml is up-to-date with the compiled lock (backend: $SELECTED_TORCH_BACKEND)."
+    else
+      echo "No pylock.toml found to check against; run --update-lock to generate one.";
+      return 3
+    fi
+  fi
 
   # Decide torch backend if not explicitly provided
   # Ensure sync uses the same backend as the compile step unless the user explicitly
@@ -392,25 +428,37 @@ install_uv() {
     if [ -n "$SYNC_TARGET" ]; then
       echo "Running dry-run preview (uv pip sync --dry-run) against: $SYNC_TARGET"
       if "$UV_BIN" pip sync "$SYNC_TARGET" --python "$VENV_PYTHON" --torch-backend "$TORCH_BACKEND" --dry-run; then
-        read -rp "Proceed with actual installation? [y/N]: " _resp
-        if ! printf '%s' "${_resp:-N}" | grep -Eq '^[Yy]'; then
-          echo "Aborting per user request"
-          return 0
+        if [ "$AUTO_YES" = true ] || [ "$APPLY" = true ]; then
+          echo "Auto-confirm enabled; proceeding with actual installation"
+        else
+          read -rp "Proceed with actual installation? [y/N]: " _resp
+          if ! printf '%s' "${_resp:-N}" | grep -Eq '^[Yy]'; then
+            echo "Aborting per user request"
+            return 0
+          fi
         fi
       else
-        echo "Dry-run preview failed or --dry-run unsupported. Continue with install? [y/N]"
-        read -rp "" _resp
-        if ! printf '%s' "${_resp:-N}" | grep -Eq '^[Yy]'; then
-          echo "Aborting per user request"
-          return 1
+        if [ "$AUTO_YES" = true ] || [ "$APPLY" = true ]; then
+          echo "Dry-run not supported or failed; AUTO_YES/APPLY set - continuing with installation"
+        else
+          echo "Dry-run preview failed or --dry-run unsupported. Continue with install? [y/N]"
+          read -rp "" _resp
+          if ! printf '%s' "${_resp:-N}" | grep -Eq '^[Yy]'; then
+            echo "Aborting per user request"
+            return 1
+          fi
         fi
       fi
     else
       echo "No lockfile (uv.lock/pylock.toml) found; cannot perform a dry-run preview for pip install -r requirements.txt"
-      read -rp "Proceed with pip install -r requirements.txt? [y/N]: " _resp
-      if ! printf '%s' "${_resp:-N}" | grep -Eq '^[Yy]'; then
-        echo "Aborting per user request"
-        return 1
+      if [ "$AUTO_YES" = true ] || [ "$APPLY" = true ]; then
+        echo "AUTO_YES/APPLY set - proceeding with pip install -r requirements.txt"
+      else
+        read -rp "Proceed with pip install -r requirements.txt? [y/N]: " _resp
+        if ! printf '%s' "${_resp:-N}" | grep -Eq '^[Yy]'; then
+          echo "Aborting per user request"
+          return 1
+        fi
       fi
     fi
   fi
