@@ -223,6 +223,7 @@ install_uv() {
   local AUTO_GPU_DETECT=true
   local DRY_RUN=false
   local AUTO_YES=false
+  local APPLY=false
   local VENV_DIR="$DEFAULT_VENV_DIR"
   local PYTHON_BIN="$DEFAULT_PYTHON"
   local UV_BIN="$DEFAULT_UV_BIN"
@@ -248,6 +249,8 @@ install_uv() {
         INSTALL_SHELL_FUNC=true; shift;;
       --dry-run)
         DRY_RUN=true; shift;;
+      --apply)
+        APPLY=true; shift;;
       -y|--yes)
         AUTO_YES=true; shift;;
       -h|--help)
