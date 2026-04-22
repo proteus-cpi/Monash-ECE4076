@@ -5,7 +5,8 @@
 # define the following functions:
 #   install_uv [options]        Create a local virtualenv (default ./.venv) and install deps
 #   activate_venv (alias: activate-venv)
-#   install_activate_func       Append activate_venv and alias activate-venv to ~/.bashrc
+#   install_activate_func       Write activate_venv helper to ~/.local/etc/bash.d and print a one-time
+#                               snippet to enable it in your shell rc (the script does NOT edit ~/.bashrc)
 #
 # If you run this file directly (./source_me_first_4_uv.sh) it will print a short error and exit.
 
@@ -22,7 +23,7 @@ Options:
   --venv-dir <path>       Path to virtualenv (default: ./.venv)
   --python <interpreter>  Python interpreter to use to create the venv (default: python3)
   --uv-bin <path>         Path to the uv binary (default: uv)
-  --install-shell-func    Append activate_venv() and alias activate-venv to ~/.bashrc
+  --install-shell-func    Install activate_venv helper to ~/.local/etc/bash.d and print one-time enable snippet
   --no-gpu-detect         Disable automatic GPU detection for selecting torch backend
   --dry-run               Preview the uv pip sync plan and prompt before installing
   -y, --yes               Assume yes for prompts (useful for CI)
@@ -68,6 +69,20 @@ DEFAULT_UV_BIN="${UV_BIN:-uv}"
 DEFAULT_KERNEL_NAME="ece4076"
 DEFAULT_DISPLAY_NAME="ECE4076"
 
+# --------------------------- Installer ID -----------------------------
+# A short identifier (git short SHA when available, else a UTC timestamp)
+# Printed when this file is sourced to help diagnose which copy/version is loaded.
+INSTALLER_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+if command -v git >/dev/null 2>&1; then
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    _gsha=$(git rev-parse --short HEAD 2>/dev/null || true)
+    if [ -n "$_gsha" ]; then
+      INSTALLER_ID="git:$_gsha"
+    fi
+    unset _gsha
+  fi
+fi
+
 # --------------------------- Help -------------------------------------
 install_uv_help() {
   cat <<'HELP'
@@ -81,7 +96,7 @@ Options:
   --venv-dir <path>       Path to virtualenv (default: ./.venv)
   --python <interpreter>  Python interpreter to use to create the venv (default: python3)
   --uv-bin <path>         Path to the uv binary (default: uv)
-  --install-shell-func    Append activate_venv() and alias activate-venv to ~/.bashrc
+  --install-shell-func    Install activate_venv helper to ~/.local/etc/bash.d and print one-time enable snippet
   --no-gpu-detect         Disable automatic GPU detection for selecting torch backend
   --dry-run               Preview the uv pip sync plan and prompt before installing
   -y, --yes               Assume yes for prompts (useful for CI)
@@ -167,7 +182,9 @@ list_available_pythons() {
 
 # --------------------------- Activation Helper ------------------------
 # Finds candidate virtualenv directories in the current folder and offers to
-# activate one. This function is suitable for appending to ~/.bashrc.
+# activate one. This function is suitable for being installed as a shell helper
+# (the installer writes it to ~/.local/etc/bash.d and prints a one-time snippet
+# that you can add to your shell rc to enable it).
 activate_venv() {
   local candidates=()
   local d nd
@@ -247,27 +264,47 @@ activate_venv() {
 alias activate-venv='activate_venv'
 
 
-# --------------------------- Install to ~/.bashrc ---------------------
-# Appends the activate_venv function to ~/.bashrc if not already present.
+# --------------------------- Install activate_venv helper ---------------------
+# Instead of editing shell rc files, write the helper to
+# ~/.local/etc/bash.d/50-activate-venv.sh and print a one-time snippet the
+# user can add to their shell rc (the script does NOT edit ~/.bashrc).
 install_activate_func() {
-  # Optional first arg: auto-confirm ("true" to skip prompts)
-  local AUTO_CONFIRM="${1:-}"
-  local rcfile="${HOME}/.bashrc"
+  local auto_confirm="${1:-}"
+  local local_dir="${HOME}/.local/etc/bash.d"
+  local target_file="$local_dir/50-activate-venv.sh"
 
-  # Verify writeability (allow creating the file if HOME is writable)
-  if [ -e "$rcfile" ] && [ ! -w "$rcfile" ] && [ ! -w "${HOME}" ]; then
-    echo "Cannot write to $rcfile; check permissions or install manually."
-    return 1
+  if ! mkdir -p "$local_dir" 2>/dev/null; then
+    echo "Failed to create directory: $local_dir"; return 1
   fi
 
-  # Create a temporary file that contains the canonical activate_venv block
-  local blockfile tmpfile backup
-  blockfile=$(mktemp -t activate_venv.block.XXXXXX) || { echo "mktemp failed"; return 1; }
-  cat > "$blockfile" <<'BASHFUNC'
-# BEGIN activate_venv (added by source_me_first_4_uv.sh)
+  if [ -f "$target_file" ]; then
+    echo "File already exists: $target_file"
+    if [ "$auto_confirm" != "true" ]; then
+      read -rp "Overwrite $target_file? [y/N]: " _ans
+      if ! printf '%s' "${_ans:-N}" | grep -Eq '^[Yy]'; then
+        echo "Left existing file in place. To enable the helper, add the snippet shown below to your shell rc (e.g. ~/.bashrc)."
+        echo
+        cat <<'SNIP'
+# Add once to your shell rc (e.g. ~/.bashrc) to source the activate-venv helper
+if [ -f "$HOME/.local/etc/bash.d/50-activate-venv.sh" ]; then
+  source "$HOME/.local/etc/bash.d/50-activate-venv.sh"
+fi
+SNIP
+        return 0
+      fi
+    fi
+    local backup="$target_file.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+    cp -a "$target_file" "$backup" 2>/dev/null || true
+    echo "Backed up existing file to: $backup"
+  fi
+
+  local tmpf
+  tmpf=$(mktemp -t activate_venv.XXXXXX) || { echo "mktemp failed"; return 1; }
+  cat > "$tmpf" <<'SH'
+# This file defines the activate_venv helper used by the ECE4076 installer.
 activate_venv() {
   local candidates=()
-  local d
+  local d nd
   for d in ./* ./.?*; do
     [ -e "$d" ] || continue
     case "$d" in
@@ -313,7 +350,6 @@ activate_venv() {
     echo "Selection out of range"
     return 1
   fi
-
   local target="${candidates[$((sel-1))]}"
   if [ -f "$target/bin/activate" ]; then
     # shellcheck disable=SC1090
@@ -330,128 +366,26 @@ activate_venv() {
     return 1
   fi
 }
-# END activate_venv
 
 alias activate-venv='activate_venv'
-BASHFUNC
+SH
+  mv "$tmpf" "$target_file" || { echo "Failed to move file into place"; rm -f "$tmpf"; return 1; }
+  chmod 644 "$target_file" || true
 
-  # Helper: prompt with optional auto-confirm
-  _ask_confirm() {
-    local prompt="$1" default_yes=${2:-false}
-    if [ "$AUTO_CONFIRM" = "true" ] || [ "$AUTO_CONFIRM" = "yes" ]; then
-      return 0
-    fi
-    local ans
-    if [ "$default_yes" = true ]; then
-      read -rp "$prompt [Y/n]: " ans
-      ans="${ans:-Y}"
-    else
-      read -rp "$prompt [y/N]: " ans
-      ans="${ans:-N}"
-    fi
-    case "$ans" in
-      [Yy]*) return 0 ;;
-      *) return 1 ;;
-    esac
-  }
+  echo "Wrote activate_venv helper to: $target_file"
+  echo
+  echo "To enable this helper in new shells, add the following snippet to your shell rc (only needs to be done once):"
+  echo
+  cat <<'SNIP'
+# Add once to your shell rc (e.g. ~/.bashrc) to source the activate-venv helper
+if [ -f "$HOME/.local/etc/bash.d/50-activate-venv.sh" ]; then
+  source "$HOME/.local/etc/bash.d/50-activate-venv.sh"
+fi
+SNIP
 
-  # Search for an explicit marker block first
-  local bline eline
-  bline=$(grep -n '^# BEGIN activate_venv' "$rcfile" 2>/dev/null | cut -d: -f1 | head -n1 || true)
-  if [ -n "$bline" ]; then
-    # find the END marker after the BEGIN marker
-    eline=$(awk -v b="$bline" 'NR>=b && /# END activate_venv/ {print NR; exit}' "$rcfile" 2>/dev/null || true)
-  fi
-
-  # If no marker block, try to find an unmarked function definition and its end
-  local fstart fend
-  if [ -z "$bline" ]; then
-    fstart=$(awk '/^[[:space:]]*(function[[:space:]]+activate_venv|activate_venv[[:space:]]*\(\))/ {print NR; exit}' "$rcfile" 2>/dev/null || true)
-    if [ -n "$fstart" ]; then
-      # find function end by scanning braces from fstart
-      local lineno=0 line brace open close
-      while IFS= read -r line || [ -n "$line" ]; do
-        lineno=$((lineno+1))
-        if [ "$lineno" -lt "$fstart" ]; then
-          continue
-        fi
-        # if this is the first line of the function, initialize brace count
-        open=$(printf '%s' "$line" | tr -cd '{' | wc -c)
-        close=$(printf '%s' "$line" | tr -cd '}' | wc -c)
-        brace=$((brace + open - close))
-        if [ $brace -le 0 ]; then
-          fend=$lineno
-          break
-        fi
-      done < "$rcfile"
-      # if we reached EOF and didn't close, set end to last line
-      if [ -z "$fend" ]; then
-        fend=$lineno
-      fi
-    fi
-  fi
-
-  # Summarize findings and ask user what to do
-  if [ -n "$bline" ] && [ -n "$eline" ]; then
-    local ctx_start=$(( bline > 3 ? bline - 2 : 1 ))
-    echo "Found existing activate_venv block (marked) in $rcfile: lines ${bline}-${eline}."
-    sed -n "${ctx_start},$(( eline + 2 ))p" "$rcfile" | sed -n '1,200p'
-    if _ask_confirm "Replace existing marked activate_venv block in $rcfile?" false; then
-      : # proceed with replacement
-    else
-      rm -f "$blockfile"
-      echo "No changes made to $rcfile"
-      return 0
-    fi
-    local start_line="$bline" end_line="$eline"
-  elif [ -n "$fstart" ] && [ -n "$fend" ]; then
-    local ctx_start=$(( fstart > 3 ? fstart - 2 : 1 ))
-    echo "Found existing activate_venv function (unmarked) in $rcfile: lines ${fstart}-${fend}."
-    sed -n "${ctx_start},$(( fend + 2 ))p" "$rcfile" | sed -n '1,200p'
-    if _ask_confirm "Replace existing activate_venv function in $rcfile?" false; then
-      : # proceed
-    else
-      rm -f "$blockfile"
-      echo "No changes made to $rcfile"
-      return 0
-    fi
-    local start_line="$fstart" end_line="$fend"
-  else
-    echo "No existing activate_venv found in $rcfile."
-    if _ask_confirm "Append activate_venv to the end of $rcfile?" true; then
-      # append
-      backup="${rcfile}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
-      cp -a "$rcfile" "$backup" 2>/dev/null || true
-      echo >> "$rcfile"
-      cat "$blockfile" >> "$rcfile"
-      rm -f "$blockfile"
-      echo "Appended activate_venv and alias activate-venv to $rcfile (backup: $backup)"
-      return 0
-    else
-      rm -f "$blockfile"
-      echo "No changes made to $rcfile"
-      return 0
-    fi
-  fi
-
-  # Perform replacement between start_line and end_line (inclusive)
-  tmpfile=$(mktemp -t activate_venv.rc.XXXXXX) || { echo "mktemp failed"; rm -f "$blockfile"; return 1; }
-  backup="${rcfile}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
-  cp -a "$rcfile" "$backup" 2>/dev/null || true
-  # head (lines before start)
-  if [ "$start_line" -gt 1 ]; then
-    head -n $(( start_line - 1 )) "$rcfile" > "$tmpfile"
-  else
-    : > "$tmpfile"
-  fi
-  # insert block
-  cat "$blockfile" >> "$tmpfile"
-  # append tail (lines after end)
-  tail -n +$(( end_line + 1 )) "$rcfile" >> "$tmpfile"
-  # install
-  mv "$tmpfile" "$rcfile"
-  rm -f "$blockfile"
-  echo "Replaced activate_venv in $rcfile (backup: $backup)"
+  echo
+  echo "Alternatively, to source all snippets in ~/.local/etc/bash.d, add this instead:"
+  echo 'for f in "$HOME/.local/etc/bash.d"/*.sh; do [ -r "$f" ] && source "$f"; done'
   return 0
 }
 
@@ -1022,12 +956,16 @@ source_me_first_4_uv.sh loaded — quick start
      activate-venv   # alias for activate_venv()
 
 4) Make activate-venv available in new shells:
-     install_uv --install-shell-func
+     install_uv --install-shell-func    # writes helper to ~/.local/etc/bash.d and prints a one-time
+                                       # snippet to enable it in your shell rc; it does NOT edit your rc
 
 5) See full installer help:
      install_uv --help
 
 GUIDE
 fi
+
+# Print installer id to help debugging which copy/version was sourced
+printf 'installer id: %s\n' "${INSTALLER_ID-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 # End of file - functions are defined when this file is sourced.
