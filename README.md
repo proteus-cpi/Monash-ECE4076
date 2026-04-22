@@ -60,6 +60,29 @@ chmod +x install.sh
 install.bat
 ```
 
+### Alternative: uv-based installer (advanced)
+
+This repository also includes a uv-based installer script that provides a reproducible venv workflow and extra helpers. The script is intended to be sourced into your shell (not executed):
+
+```bash
+source ./source_me_first_4_uv.sh
+install_uv --help
+```
+
+Notable features:
+- `--auto-install-python`: If the requested Python interpreter (for example `python3.11`) is not available on the system, the installer can optionally attempt to install it via `pyenv` (it will prompt first unless you pass `-y`). Example:
+
+```bash
+install_uv --python python3.11 --auto-install-python
+```
+
+- `list_available_pythons` helper: when a requested interpreter is missing the installer lists Python executables found on PATH, common locations, local venvs, and `pyenv` installed versions to help you pick a match.
+
+Caveats:
+- Installing Python via `pyenv` may require OS-level build dependencies (compilers, libssl, zlib, etc.). If `pyenv install` fails, follow the `pyenv` documentation to install required build packages: https://github.com/pyenv/pyenv/wiki#suggested-build-environment
+- For CI environments, prefer to pre-install the desired interpreter on the runner for speed and reliability rather than using `--auto-install-python`.
+
+
 **Step 2: Open in VS Code**
 
 - File → Open Folder → Select this ECE4076 folder
@@ -195,4 +218,3 @@ You may want to brush up on Python skills before starting. Check out this [Pytho
 - Aaron Choong
 - Haoyang Jiang
 - Week 5 based on an example from Tom Drummond
-
