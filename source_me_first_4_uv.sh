@@ -443,6 +443,18 @@ install_uv() {
     esac
   done
 
+  # If the user only requested the shell helper, perform that action and exit
+  # immediately. This avoids running the full install flow when the user only
+  # wants the activation helper installed.
+  if [ "$INSTALL_SHELL_FUNC" = true ]; then
+    if [ "$AUTO_YES" = true ]; then
+      install_activate_func true || { echo "failed to install shell function"; return 1; }
+    else
+      install_activate_func || { echo "failed to install shell function"; return 1; }
+    fi
+    return 0
+  fi
+
   printf '== ECE4076 Installation (uv) ==\n'
   printf '  venv dir: %s\n' "$VENV_DIR"
   printf '  python:   %s\n' "$PYTHON_BIN"

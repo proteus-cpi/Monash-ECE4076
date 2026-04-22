@@ -78,6 +78,12 @@ install_uv --python python3.11 --auto-install-python
 
 - `list_available_pythons` helper: when a requested interpreter is missing the installer lists Python executables found on PATH, common locations, local venvs, and `pyenv` installed versions to help you pick a match.
 
+- `--install-shell-func` is standalone: when passed to `install_uv` the installer will only write the
+  activation helper to `~/.local/etc/bash.d/50-activate-venv.sh` and print a one-time snippet you can add
+  to your shell rc (for example `~/.bashrc`). It will then exit immediately and will not perform venv
+  creation or package installation. Run the installation separately when you want to create the venv and
+  install packages (e.g. `install_uv --cpu-torch`).
+
 Caveats:
 - Installing Python via `pyenv` may require OS-level build dependencies (compilers, libssl, zlib, etc.). If `pyenv install` fails, follow the `pyenv` documentation to install required build packages: https://github.com/pyenv/pyenv/wiki#suggested-build-environment
 - For CI environments, prefer to pre-install the desired interpreter on the runner for speed and reliability rather than using `--auto-install-python`.
