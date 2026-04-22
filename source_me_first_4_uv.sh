@@ -26,6 +26,7 @@ Options:
   --no-gpu-detect         Disable automatic GPU detection for selecting torch backend
   --dry-run               Preview the uv pip sync plan and prompt before installing
   -y, --yes               Assume yes for prompts (useful for CI)
+  --auto-install-python   If the requested Python is missing, attempt to install it via pyenv (may prompt)
   -h, --help              Show this help
 
 Examples:
@@ -84,6 +85,7 @@ Options:
   --no-gpu-detect         Disable automatic GPU detection for selecting torch backend
   --dry-run               Preview the uv pip sync plan and prompt before installing
   -y, --yes               Assume yes for prompts (useful for CI)
+  --auto-install-python   If the requested Python is missing, attempt to install it via pyenv (may prompt)
   -h, --help              Show this help
 
 Examples:
@@ -93,17 +95,95 @@ Examples:
 HELP
 }
 
+# List available python executables and pyenv versions (helper)
+list_available_pythons() {
+  echo
+  echo "Searching for python executables in PATH and common locations..."
+  local old_nullglob
+  shopt -q nullglob 2>/dev/null && old_nullglob=1 || old_nullglob=0
+  shopt -s nullglob 2>/dev/null || true
+
+  local candidates=()
+  local p
+  # Use which -a when available to find PATH entries
+  if command -v which >/dev/null 2>&1; then
+    # try a few common names
+    for p in $(which -a python python3 python2 2>/dev/null | awk '!x[$0]++'); do
+      [ -x "$p" ] || continue
+      candidates+=("$p")
+    done
+  fi
+
+  # add common system locations, pyenv installs, local venvs
+  for p in /usr/bin/python* /usr/local/bin/python* /opt/homebrew/bin/python* /opt/python*/bin/python* "$HOME/.pyenv/versions/"*/bin/python* "$HOME/.pyenv/shims/python"* "$HOME/.local/bin/python*"; do
+    [ -x "$p" ] || continue
+    candidates+=("$p")
+  done
+
+  # include local venvs in cwd
+  for p in ./.venv*/bin/python* ./.venv*/Scripts/python*; do
+    [ -x "$p" ] || continue
+    candidates+=("$p")
+  done
+
+  # deduplicate preserving order
+  local seen=()
+  local uniq_list=()
+  for p in "${candidates[@]}"; do
+    local skip=0
+    for q in "${seen[@]}"; do
+      if [ "$p" = "$q" ]; then skip=1; break; fi
+    done
+    if [ $skip -eq 0 ]; then
+      seen+=("$p")
+      uniq_list+=("$p")
+    fi
+  done
+
+  if [ ${#uniq_list[@]} -eq 0 ]; then
+    echo "  (no python executables found)"
+  else
+    local i=0
+    for p in "${uniq_list[@]}"; do
+      i=$((i+1))
+      local ver
+      ver="$($p --version 2>&1 || true)"
+      printf "%3d) %-45s %s\n" "$i" "$p" "$ver"
+    done
+  fi
+
+  if command -v pyenv >/dev/null 2>&1; then
+    echo
+    echo "pyenv installed versions:"
+    pyenv versions --bare 2>/dev/null | sed -e 's/^/  - /' || true
+  fi
+
+  if [ $old_nullglob -eq 0 ]; then
+    shopt -u nullglob 2>/dev/null || true
+  fi
+  echo
+}
+
 
 # --------------------------- Activation Helper ------------------------
 # Finds candidate virtualenv directories in the current folder and offers to
 # activate one. This function is suitable for appending to ~/.bashrc.
 activate_venv() {
   local candidates=()
-  local d
-  for d in ./*; do
+  local d nd
+  # include both visible and hidden directories (e.g. .venv)
+  for d in ./* ./.?*; do
     [ -e "$d" ] || continue
+    # skip '.' and '..' entries that may appear from the .?* glob
+    case "$d" in
+      .|./.|../|./..)
+        continue
+        ;;
+    esac
+    # normalize to remove leading './' for nicer display and comparison
+    nd="${d#./}"
     if [ -d "$d" ] && ( [ -f "$d/bin/activate" ] || [ -f "$d/Scripts/activate" ] || [ -f "$d/pyvenv.cfg" ] ); then
-      candidates+=("$d")
+      candidates+=("$nd")
     fi
   done
 
@@ -186,10 +266,16 @@ install_activate_func() {
 activate_venv() {
   local candidates=()
   local d
-  for d in ./*; do
+  for d in ./* ./.?*; do
     [ -e "$d" ] || continue
+    case "$d" in
+      .|./.|../|./..)
+        continue
+        ;;
+    esac
+    nd="${d#./}"
     if [ -d "$d" ] && ( [ -f "$d/bin/activate" ] || [ -f "$d/Scripts/activate" ] || [ -f "$d/pyvenv.cfg" ] ); then
-      candidates+=("$d")
+      candidates+=("$nd")
     fi
   done
   if [ -d .venv ]; then
@@ -260,6 +346,7 @@ install_uv() {
   local DRY_RUN=false
   local AUTO_YES=false
   local APPLY=false
+  local AUTO_INSTALL_PYTHON=false
   local CHECK_LOCK=false
   local UPDATE_LOCK=false
   local VENV_DIR="$DEFAULT_VENV_DIR"
@@ -293,6 +380,8 @@ install_uv() {
         CHECK_LOCK=true; shift;;
       --update-lock)
         UPDATE_LOCK=true; shift;;
+      --auto-install-python)
+        AUTO_INSTALL_PYTHON=true; shift;;
       -y|--yes)
         AUTO_YES=true; shift;;
       -h|--help)
@@ -318,8 +407,139 @@ install_uv() {
   fi
 
   if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-    echo "ERROR: Python interpreter '$PYTHON_BIN' not found"
-    return 1
+    echo "ERROR: Python interpreter '$PYTHON_BIN' not found."
+
+    # Try to detect a requested version from the interpreter name (e.g. python3.11)
+    local _py_base _py_version _major _minor
+    _py_base="$(basename "$PYTHON_BIN")"
+    _py_version=""
+    if [[ "$_py_base" =~ ^python([0-9]+)(\.[0-9]+)? ]]; then
+      _major="${BASH_REMATCH[1]}"
+      _minor="${BASH_REMATCH[2]}"
+      if [ -n "$_minor" ]; then
+        _minor="${_minor#.}"
+        _py_version="${_major}.${_minor}"
+      else
+        _py_version="${_major}"
+      fi
+    elif [[ "$_py_base" =~ ^([0-9]+\.[0-9]+)$ ]]; then
+      _py_version="${BASH_REMATCH[1]}"
+    fi
+
+    # Helper: list available python executables and suggest closest match
+    list_available_pythons
+
+    if [ -n "$_py_version" ]; then
+      echo
+      echo "Requested Python version inferred from '$PYTHON_BIN': $_py_version"
+      if [ "$AUTO_INSTALL_PYTHON" = true ]; then
+        echo "Auto-install requested: attempting to install with pyenv..."
+        # Ensure pyenv present or offer to install it
+        if ! command -v pyenv >/dev/null 2>&1; then
+          if [ "$AUTO_YES" = true ]; then
+            _do_install_pyenv=yes
+          else
+            read -rp "pyenv not found. Install pyenv now? [y/N]: " _ans
+            if printf '%s' "${_ans:-N}" | grep -Eq '^[Yy]'; then _do_install_pyenv=yes; fi
+          fi
+          if [ "${_do_install_pyenv:-}" = "yes" ]; then
+            echo "Installing pyenv (this will clone into ~/.pyenv)..."
+            if command -v curl >/dev/null 2>&1; then
+              curl -sS https://pyenv.run | bash || { echo "pyenv installer failed"; return 1; }
+            elif command -v wget >/dev/null 2>&1; then
+              wget -qO- https://pyenv.run | bash || { echo "pyenv installer failed"; return 1; }
+            else
+              echo "Cannot download pyenv installer (curl or wget required)"; return 1
+            fi
+            # Export pyenv into current shell session so we can use it immediately
+            export PATH="$HOME/.pyenv/bin:$PATH"
+            if command -v pyenv >/dev/null 2>&1; then
+              # shellcheck disable=SC1091
+              eval "$(pyenv init -)" 2>/dev/null || true
+            fi
+          else
+            echo "pyenv not installed; aborting auto-install of Python."
+            return 1
+          fi
+        fi
+
+        # At this point pyenv should be available. Find a matching full version
+        local _full_version
+        _full_version=$(pyenv install --list 2>/dev/null | sed -e 's/^[[:space:]]*//' | grep -E "^${_py_version}\\.[0-9]+$" | tail -1 || true)
+        if [ -z "$_full_version" ]; then
+          # try more general match
+          _full_version=$(pyenv install --list 2>/dev/null | sed -e 's/^[[:space:]]*//' | grep -E "^${_py_version}" | tail -1 || true)
+        fi
+        if [ -z "$_full_version" ]; then
+          echo "Could not locate a pyenv-distributable Python matching ${_py_version}."
+          echo "Run 'pyenv install --list' to view available versions, then install manually."
+          return 1
+        fi
+
+        echo "Installing Python ${_full_version} via pyenv (may require development build deps)..."
+        # Use -s to skip if already installed (pyenv may support -s)
+        if pyenv install -s "$_full_version"; then
+          echo "Python ${_full_version} installed via pyenv"
+        else
+          echo "pyenv install failed. Ensure build dependencies are present. See https://github.com/pyenv/pyenv/wiki#suggested-build-environment";
+          return 1
+        fi
+
+        # Make the installed interpreter available in this shell
+        export PATH="$HOME/.pyenv/bin:$PATH"
+        eval "$(pyenv init -)" 2>/dev/null || true
+        pyenv rehash 2>/dev/null || true
+
+        # Use the newly installed interpreter path for subsequent operations
+        local _installed_python
+        _installed_python=$(pyenv which python 2>/dev/null || true)
+        if [ -n "$_installed_python" ] && [ -x "$_installed_python" ]; then
+          PYTHON_BIN="$_installed_python"
+          echo "Using Python interpreter: $PYTHON_BIN"
+        else
+          # fallback: try to construct path from pyenv root
+          local _pfx
+          _pfx=$(pyenv prefix "$_full_version" 2>/dev/null || true)
+          if [ -n "$_pfx" ] && [ -x "$_pfx/bin/python" ]; then
+            PYTHON_BIN="$_pfx/bin/python"
+            echo "Using Python interpreter: $PYTHON_BIN"
+          else
+            echo "Failed to locate the installed Python executable."
+            return 1
+          fi
+        fi
+
+        # Continue the install using the newly installed interpreter
+      else
+        # Not auto-installing: provide instructions
+        if command -v pyenv >/dev/null 2>&1; then
+          echo "pyenv is installed. To install a matching Python, run:"
+          echo
+          echo "  pyenv install --list  # find a full version matching ${_py_version}, e.g. ${_py_version}.X"
+          echo "  pyenv install <full-version>"
+          echo "  pyenv local <full-version>"
+          echo
+          echo "Then re-run: install_uv --python ${PYTHON_BIN}"
+        else
+          echo "Install pyenv and then install a matching Python version. Example:" 
+          echo
+          echo "  # install pyenv (one-line installer)"
+          echo "  curl https://pyenv.run | bash"
+          echo "  # follow the post-install instructions printed by the installer (add pyenv to PATH / shell init)"
+          echo "  pyenv install --list  # choose a full version matching ${_py_version}, e.g. ${_py_version}.X"
+          echo "  pyenv install <full-version>"
+          echo "  pyenv local <full-version>"
+          echo
+          echo "Then re-run: install_uv --python ${PYTHON_BIN}"
+        fi
+        return 1
+      fi
+    else
+      echo
+      echo "Please install a suitable Python interpreter named '${PYTHON_BIN}' or provide an absolute path to a Python executable."
+      echo "You can use pyenv to install interpreters: https://github.com/pyenv/pyenv"
+      return 1
+    fi
   fi
 
   local PY_VER
